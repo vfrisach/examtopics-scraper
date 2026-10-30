@@ -10,6 +10,36 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").replace("\xa0", " ")).strip()
 
 
+_OPTION_START = re.compile(r"^([A-F])[.)]\s*(.*)$")
+
+
+def _split_inline_options(text: str):
+    """
+    Split question text where options are inline lines such as "A." followed by
+    the option text (ExamTopics renders them as `<br>A.<newline>text<br>`).
+    Letters must appear in order (A, B, C...) so stray "A." in the stem is ignored.
+    Returns (question_text, {"A": "...", ...}).
+    """
+    stem: List[str] = []
+    options: Dict[str, str] = {}
+    current: Optional[str] = None
+    for raw_line in text.splitlines():
+        line = _clean(raw_line)
+        if not line:
+            continue
+        m = _OPTION_START.match(line)
+        expected = chr(ord("A") + len(options))
+        if m and m.group(1) == expected:
+            current = expected
+            options[current] = m.group(2)
+            continue
+        if current:
+            options[current] = _clean(f"{options[current]} {line}")
+        else:
+            stem.append(line)
+    return _clean(" ".join(stem)), options
+
+
 def parse_question_page(html: str, url: str = "") -> Dict:
     """
     Returns a dict:
@@ -49,13 +79,16 @@ def parse_question_page(html: str, url: str = "") -> Dict:
             ".answer, .options, .vote-button, .answer-vote-button"
         ):
             junk.decompose()
-        question_text = _clean(q_body_copy.get_text(" "))
+        for junk in q_body_copy.select("a.btn"):
+            junk.decompose()
+        question_text, inline_options = _split_inline_options(q_body_copy.get_text("\n"))
         # Strip trailing site boilerplate button text that leaks in
         # regardless of which element it's actually wrapped in.
         question_text = re.sub(r"\s*Show Suggested Answer\s*$", "", question_text, flags=re.I).strip()
         result["question"] = question_text
     else:
         result["question"] = ""
+        inline_options = {}
 
     # ── Options ───────────────────────────────────────────────────────
     options: Dict[str, str] = {}
@@ -67,7 +100,10 @@ def parse_question_page(html: str, url: str = "") -> Dict:
             letter_el.decompose()
             text = _clean(li.get_text(" "))
             options[letter] = text
-    # Strategy 2: fallback — lines starting with A. B. C. D. inside question card
+    # Strategy 2: inline "A." / "B." lines inside the question body
+    if not options:
+        options = inline_options
+    # Strategy 3: fallback — lines starting with A. B. C. D. inside question card
     if not options:
         card = soup.select_one(".question-card, .card")
         if card:

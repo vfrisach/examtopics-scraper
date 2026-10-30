@@ -8,7 +8,22 @@ from urllib3.util.retry import Retry
 
 from .cache import HtmlCache
 from .parsers import raise_if_blocked
-from .settings import MAX_HTTP_POOL_SIZE, REQUEST_HEADERS
+from .settings import (
+    MAX_HTTP_POOL_SIZE,
+    RATE_LIMIT_BACKOFF_SECONDS,
+    RATE_LIMIT_MAX_BACKOFF_SECONDS,
+    REQUEST_HEADERS,
+)
+
+RATE_LIMIT_STATUSES = {429, 503}
+
+
+def _retry_after_seconds(response: requests.Response) -> Optional[float]:
+    value = response.headers.get("Retry-After", "").strip()
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        return None
 
 
 class SessionFactory:
@@ -57,6 +72,19 @@ class HttpFetcher:
         self.cache = cache
         self.refresh_cache = refresh_cache
         self.session_factory = session_factory or SessionFactory()
+        self._cooldown_lock = threading.Lock()
+        self._cooldown_until = 0.0
+
+    def _wait_for_cooldown(self) -> None:
+        # Shared across worker threads so a single 429 pauses every request.
+        with self._cooldown_lock:
+            remaining = self._cooldown_until - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _start_cooldown(self, seconds: float) -> None:
+        with self._cooldown_lock:
+            self._cooldown_until = max(self._cooldown_until, time.monotonic() + seconds)
 
     def fetch_html(self, url: str) -> str:
         if self.cache is not None and not self.refresh_cache:
@@ -66,8 +94,18 @@ class HttpFetcher:
 
         last_error = None
         for attempt in range(1, self.retries + 1):
+            self._wait_for_cooldown()
             try:
                 response = self.session_factory.get().get(url, timeout=self.timeout)
+                if response.status_code in RATE_LIMIT_STATUSES and attempt < self.retries:
+                    wait = _retry_after_seconds(response)
+                    if wait is None:
+                        wait = RATE_LIMIT_BACKOFF_SECONDS * 2 ** (attempt - 1)
+                    wait = min(wait, RATE_LIMIT_MAX_BACKOFF_SECONDS)
+                    print(f"\nRate limited ({response.status_code}) on {url}; waiting {wait:.0f}s")
+                    self._start_cooldown(wait)
+                    last_error = requests.HTTPError(f"{response.status_code} Too Many Requests", response=response)
+                    continue
                 response.raise_for_status()
                 raise_if_blocked(response.text)
                 if self.cache is not None:
